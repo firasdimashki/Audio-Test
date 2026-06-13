@@ -8,30 +8,51 @@ from matplotlib.animation import FuncAnimation
 import sounddevice as sd
 
 
-def dc_block_filter(
+def design_bandpass_biquad(
+    *,
+    center_hz: float,
+    bandwidth_hz: float,
+    samplerate: int,
+) -> tuple[float, float, float, float, float]:
+    """Return normalized biquad coefficients for a second-order band-pass filter."""
+    q = center_hz / bandwidth_hz
+    omega = 2.0 * np.pi * center_hz / float(samplerate)
+    alpha = np.sin(omega) / (2.0 * q)
+    cos_omega = np.cos(omega)
+    a0 = 1.0 + alpha
+
+    return (
+        alpha / a0,
+        0.0,
+        -alpha / a0,
+        (-2.0 * cos_omega) / a0,
+        (1.0 - alpha) / a0,
+    )
+
+
+def apply_biquad_filter(
     samples: np.ndarray,
     *,
-    alpha: float,
-    previous_input: float,
-    previous_output: float,
-) -> tuple[np.ndarray, float, float]:
-    """First-order high-pass filter, like an AC-coupling capacitor."""
+    coefficients: tuple[float, float, float, float, float],
+    state: tuple[float, float],
+) -> tuple[np.ndarray, tuple[float, float]]:
+    """Apply a biquad filter with transposed direct-form II state."""
+    b0, b1, b2, a1, a2 = coefficients
+    z1, z2 = state
     filtered = np.empty_like(samples, dtype=np.float32)
-    x_prev = previous_input
-    y_prev = previous_output
 
     for idx, x in enumerate(samples.astype(np.float32, copy=False)):
-        y = alpha * (y_prev + float(x) - x_prev)
+        y = b0 * float(x) + z1
+        z1 = b1 * float(x) - a1 * y + z2
+        z2 = b2 * float(x) - a2 * y
         filtered[idx] = y
-        x_prev = float(x)
-        y_prev = float(y)
 
-    return filtered, x_prev, y_prev
+    return filtered, (z1, z2)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Realtime microphone waveform plot.")
-    parser.add_argument("--samplerate", type=int, default=44100, help="Sample rate (Hz).")
+    parser.add_argument("--samplerate", type=int, default=48000, help="Sample rate (Hz).")
     parser.add_argument("--blocksize", type=int, default=1024, help="Audio block size (frames).")
     parser.add_argument(
         "--channels",
@@ -53,13 +74,16 @@ def main() -> None:
     )
     parser.add_argument("--device", type=str, default=None, help="sounddevice device index or None.")
     parser.add_argument(
-        "--dc-block-cutoff",
+        "--bandpass-center-hz",
         type=float,
-        default=20.0,
-        help=(
-            "High-pass cutoff in Hz for simulating a series coupling capacitor "
-            "that removes DC offset. Use 0 to disable."
-        ),
+        default=5000.0,
+        help="Band-pass center frequency in Hz for receiving the carrier signal.",
+    )
+    parser.add_argument(
+        "--bandpass-bandwidth-hz",
+        type=float,
+        default=2000.0,
+        help="Band-pass bandwidth in Hz around the center frequency.",
     )
     parser.add_argument(
         "--list-devices",
@@ -76,26 +100,35 @@ def main() -> None:
     blocksize = int(args.blocksize)
     channels = int(args.channels)
     window_samples = max(64, int(args.window_ms / 1000.0 * samplerate))
-    dc_block_cutoff = float(args.dc_block_cutoff)
-    if dc_block_cutoff < 0:
-        raise SystemExit("--dc-block-cutoff must be >= 0.")
+    bandpass_center_hz = float(args.bandpass_center_hz)
+    bandpass_bandwidth_hz = float(args.bandpass_bandwidth_hz)
+    bandpass_low_hz = bandpass_center_hz - (bandpass_bandwidth_hz / 2.0)
+    bandpass_high_hz = bandpass_center_hz + (bandpass_bandwidth_hz / 2.0)
+    nyquist_hz = samplerate / 2.0
+    if bandpass_center_hz <= 0:
+        raise SystemExit("--bandpass-center-hz must be > 0.")
+    if bandpass_bandwidth_hz <= 0:
+        raise SystemExit("--bandpass-bandwidth-hz must be > 0.")
+    if bandpass_low_hz <= 0 or bandpass_high_hz >= nyquist_hz:
+        raise SystemExit(
+            "--bandpass-bandwidth-hz must keep the filter passband above 0 Hz "
+            "and below the Nyquist frequency."
+        )
 
-    if dc_block_cutoff > 0:
-        rc = 1.0 / (2.0 * np.pi * dc_block_cutoff)
-        dt = 1.0 / float(samplerate)
-        dc_block_alpha = rc / (rc + dt)
-    else:
-        dc_block_alpha = 0.0
+    bandpass_coefficients = design_bandpass_biquad(
+        center_hz=bandpass_center_hz,
+        bandwidth_hz=bandpass_bandwidth_hz,
+        samplerate=samplerate,
+    )
 
     # Ring buffer of recent samples filled by the audio callback.
     audio_buffer = deque(maxlen=window_samples)
     buffer_lock = threading.Lock()
     last_status: str = ""
-    filter_previous_input = 0.0
-    filter_previous_output = 0.0
+    bandpass_state = (0.0, 0.0)
 
     def audio_callback(indata: np.ndarray, frames: int, time, status) -> None:
-        nonlocal filter_previous_input, filter_previous_output, last_status
+        nonlocal bandpass_state, last_status
         if status:
             # Keep the message; update the UI on the main thread.
             last_status = str(status)
@@ -106,13 +139,11 @@ def main() -> None:
         else:
             mono = np.asarray(indata).reshape(-1)
 
-        if dc_block_cutoff > 0:
-            mono, filter_previous_input, filter_previous_output = dc_block_filter(
-                mono,
-                alpha=dc_block_alpha,
-                previous_input=filter_previous_input,
-                previous_output=filter_previous_output,
-            )
+        mono, bandpass_state = apply_biquad_filter(
+            mono,
+            coefficients=bandpass_coefficients,
+            state=bandpass_state,
+        )
 
         with buffer_lock:
             # Extend in one go to reduce callback overhead.
@@ -146,10 +177,10 @@ def main() -> None:
     line, = ax.plot(x_ms, np.zeros(window_samples, dtype=np.float32), lw=1.2)
     status_text = ax.text(0.01, 0.95, "", transform=ax.transAxes, va="top")
 
-    if dc_block_cutoff > 0:
-        ax.set_title(f"Microphone waveform (DC blocked, {dc_block_cutoff:g} Hz cutoff)")
-    else:
-        ax.set_title("Microphone waveform (realtime)")
+    ax.set_title(
+        f"Microphone waveform ({bandpass_center_hz:g} Hz band-pass, "
+        f"{bandpass_bandwidth_hz:g} Hz BW)"
+    )
     ax.set_xlabel("Time (ms)")
     ax.set_ylabel("Amplitude")
     ax.set_xlim(-args.window_ms, 0)

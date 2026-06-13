@@ -32,14 +32,27 @@ def pam2_encode_nrz(bits: List[int], *, amplitude: float, samples_per_symbol: in
     return np.repeat(symbols, samples_per_symbol)
 
 
+def multiply_with_sine_carrier(
+    baseband: np.ndarray,
+    *,
+    carrier_hz: float,
+    samplerate: int,
+) -> np.ndarray:
+    """Modulate the PAM baseband by multiplying it with a sine carrier."""
+    sample_idx = np.arange(baseband.size, dtype=np.float64)
+    phase = 2.0 * np.pi * carrier_hz * sample_idx / float(samplerate)
+    carrier = np.sin(phase).astype(np.float32)
+    return (baseband.astype(np.float32, copy=False) * carrier).astype(np.float32)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Transmit terminal text over your speakers using PAM2 at a fixed baud rate (default 9600). "
+            "Transmit terminal text over your speakers using PAM2 multiplied by a sine carrier. "
             "Encodes as: [length (big-endian, 16-bit)] + [UTF-8 bytes]."
         )
     )
-    parser.add_argument("--baud", type=float, default=9600.0, help="Symbol rate in baud.")
+    parser.add_argument("--baud", type=float, default=500.0, help="Symbol rate in baud.")
     parser.add_argument("--samplerate", type=int, default=48000, help="Audio sample rate (Hz).")
     parser.add_argument("--channels", type=int, default=1, help="Output channels (1=mono, 2=stereo).")
     parser.add_argument(
@@ -64,9 +77,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--carrier-hz",
+        type=float,
+        default=5000.0,
+        help="Sine carrier frequency in Hz multiplied with the PAM signal.",
+    )
+    parser.add_argument(
         "--gap-ms",
         type=float,
-        default=250.0,
+        default=1000.0,
         help="Silence (ms) added before the frame.",
     )
     parser.add_argument(
@@ -103,6 +122,9 @@ def main() -> None:
 
     if args.channels not in (1, 2):
         raise SystemExit("--channels must be 1 or 2.")
+
+    if not (0.0 < args.carrier_hz < args.samplerate / 2.0):
+        raise SystemExit("--carrier-hz must be > 0 and below the Nyquist frequency.")
 
     # We require an integer number of samples per symbol so that symbol boundaries are exact.
     ratio = args.samplerate / args.baud
@@ -141,6 +163,12 @@ def main() -> None:
         zeros = np.zeros(gap_samples, dtype=np.float32)
         waveform = np.concatenate([zeros, waveform])
 
+    waveform = multiply_with_sine_carrier(
+        waveform,
+        carrier_hz=float(args.carrier_hz),
+        samplerate=int(args.samplerate),
+    )
+
     # Convert to shape (N, channels) for sounddevice.
     if args.channels == 2:
         waveform = np.column_stack([waveform, waveform]).astype(np.float32)
@@ -157,7 +185,7 @@ def main() -> None:
 
         plt.figure(figsize=(10, 4))
         plt.plot(t_ms, y_plot, linewidth=1.0)
-        plt.title("PAM2 transmitted waveform (time domain)")
+        plt.title(f"PAM2 waveform on {args.carrier_hz:g} Hz sine carrier")
         plt.xlabel("Time (ms)")
         plt.ylabel("Amplitude")
         plt.grid(True, alpha=0.3)
@@ -169,7 +197,8 @@ def main() -> None:
 
     print(
         f"Transmitting {len(payload)} byte(s) at {args.baud} baud "
-        f"({samples_per_symbol} samples/symbol) using PAM2."
+        f"({samples_per_symbol} samples/symbol) using PAM2 on a "
+        f"{args.carrier_hz:g} Hz sine carrier."
     )
     if not args.no_plot:
         plot_waveform(waveform)
